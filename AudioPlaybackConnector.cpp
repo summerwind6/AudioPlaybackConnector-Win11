@@ -5,6 +5,7 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
 winrt::fire_and_forget ConnectDevice(std::wstring);
+winrt::fire_and_forget ConnectDevice(DeviceInformation);
 void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
@@ -68,7 +69,6 @@ void ApplyWin11MenuStyle(MenuFlyout& menu, bool lightTheme)
 
 constexpr int MAX_CONNECTION_ATTEMPTS = 3;
 constexpr auto CONNECTION_RETRY_DELAY = std::chrono::milliseconds(400);
-constexpr auto CONNECTION_STATE_SETTLE_DELAY = std::chrono::milliseconds(150);
 
 bool IsCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
@@ -469,6 +469,61 @@ void SetupMenu()
 
 winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
+	// DeviceWatcher callbacks can run outside the XAML apartment. Recreate the
+	// device on the UI apartment before starting the audio connection, matching
+	// the object flow used by the original DevicePicker implementation.
+	auto uiContext = winrt::apartment_context();
+	try
+	{
+		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+		co_await uiContext;
+		if (g_shuttingDown)
+			co_return;
+		if (device)
+		{
+			ConnectDevice(device);
+			co_return;
+		}
+	}
+	catch (winrt::hresult_error const& ex)
+	{
+		if (g_shuttingDown)
+			co_return;
+
+		std::wstring errorMessage = ex.message().c_str();
+		errorMessage += L" (0x";
+		wchar_t errorCode[9]{};
+		swprintf_s(errorCode, L"%08X", static_cast<uint32_t>(ex.code()));
+		errorMessage += errorCode;
+		errorMessage += L")";
+		{
+			std::lock_guard lock(g_connectionMutex);
+			g_deviceErrorMessages[deviceId] = std::move(errorMessage);
+		}
+		QueueDeviceListRefresh();
+		LOG_CAUGHT_EXCEPTION();
+		co_return;
+	}
+	catch (...)
+	{
+		if (g_shuttingDown)
+			co_return;
+	}
+
+	{
+		std::lock_guard lock(g_connectionMutex);
+		g_deviceErrorMessages[deviceId] = _(L"Unknown error");
+	}
+	QueueDeviceListRefresh();
+}
+
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
+{
+	// The original project performed the complete StartAsync/OpenAsync sequence
+	// from the picker UI apartment. Preserve that behavior while the custom UI
+	// remains responsible only for displaying device rows.
+	auto uiContext = winrt::apartment_context();
+	const auto deviceId = std::wstring(device.Id());
 	{
 		std::lock_guard lock(g_connectionMutex);
 		g_deviceErrorMessages.erase(deviceId);
@@ -499,13 +554,16 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 	for (int attempt = 0; attempt < MAX_CONNECTION_ATTEMPTS && !g_shuttingDown; ++attempt)
 	{
 		if (attempt != 0)
+		{
 			co_await winrt::resume_after(CONNECTION_RETRY_DELAY);
+			co_await uiContext;
+		}
 
 		AudioPlaybackConnection connection = nullptr;
 		uint64_t generation = 0;
 		try
 		{
-			connection = AudioPlaybackConnection::TryCreateFromId(deviceId);
+			connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 			if (!connection)
 			{
 				errorMessage = _(L"Unknown error");
@@ -526,21 +584,19 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 					QueueConnectionStateChanged(deviceId, generation);
 			});
 
-			// The system binds enabling to this AudioPlaybackConnection instance.
-			// A retry creates a new instance, so it must be enabled again before open.
+			// Keep the original order and apartment: enable this connection first,
+			// then open it. A retry creates a fresh connection and repeats both.
 			co_await connection.StartAsync();
+			co_await uiContext;
 			auto result = co_await connection.OpenAsync();
+			co_await uiContext;
 
 			switch (result.Status())
 			{
 			case AudioPlaybackConnectionOpenResultStatus::Success:
-				// Win11 can report a successful open before the audio endpoint has
-				// finished entering the Opened state. Do not expose a false success.
-				co_await winrt::resume_after(CONNECTION_STATE_SETTLE_DELAY);
-					success = IsCurrentConnection(deviceId, generation) &&
-					connection.State() == AudioPlaybackConnectionState::Opened;
-				if (!success)
-					errorMessage = _(L"Unknown error");
+				// This is intentionally based on OpenAsync's result, like the
+				// original implementation. StateChanged keeps the UI in sync later.
+				success = IsCurrentConnection(deviceId, generation);
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
 				success = false;
