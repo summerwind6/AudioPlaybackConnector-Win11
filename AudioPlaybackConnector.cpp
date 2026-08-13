@@ -6,7 +6,7 @@ void SetupFlyout();
 void SetupMenu();
 winrt::fire_and_forget ConnectDevice(std::wstring_view);
 winrt::fire_and_forget ConnectDevice(DeviceInformation);
-winrt::fire_and_forget RefreshDevicePicker();
+void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
@@ -188,6 +188,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 		g_shuttingDown = true;
+		if (g_deviceWatcher)
+			g_deviceWatcher.Stop();
 		if (g_reconnect)
 			SaveSettings();
 		for (const auto& connection : g_audioPlaybackConnections)
@@ -284,6 +286,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 	}
 	break;
+	case WM_DEVICE_LIST_CHANGED:
+		RefreshDevicePicker();
+		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
 		{
@@ -723,36 +728,35 @@ void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
 	g_deviceListPanel.Children().Append(row);
 }
 
-winrt::fire_and_forget RefreshDevicePicker()
+void RefreshDevicePicker()
 {
-	const auto refreshGeneration = ++g_deviceListRefreshGeneration;
-	try
-	{
-		auto devices = co_await DeviceInformation::FindAllAsync(AudioPlaybackConnection::GetDeviceSelector());
-		if (g_shuttingDown || refreshGeneration != g_deviceListRefreshGeneration || !g_deviceListPanel)
-			co_return;
+	if (g_shuttingDown || !g_deviceListPanel)
+		return;
 
-		const bool lightTheme = IsLightTheme();
-		g_deviceListPanel.Children().Clear();
-		if (devices.Size() == 0)
-		{
-			TextBlock empty;
-			empty.Text(_(L"No compatible audio devices found"));
-			empty.FontSize(14);
-			empty.Foreground(CreateTextBrush(lightTheme, 190));
-			empty.TextWrapping(TextWrapping::Wrap);
-			empty.Margin({ 8, 16, 8, 16 });
-			g_deviceListPanel.Children().Append(empty);
-		}
-		else
-		{
-			for (const auto& device : devices)
-				AddDevicePickerRow(device, lightTheme);
-		}
-	}
-	catch (...)
+	std::vector<DeviceInformation> devices;
 	{
-		LOG_CAUGHT_EXCEPTION();
+		std::lock_guard lock(g_deviceListMutex);
+		devices.reserve(g_availableDevices.size());
+		for (const auto& [_, device] : g_availableDevices)
+			devices.push_back(device);
+	}
+
+	const bool lightTheme = IsLightTheme();
+	g_deviceListPanel.Children().Clear();
+	if (devices.empty())
+	{
+		TextBlock empty;
+		empty.Text(g_deviceEnumerationCompleted ? _(L"No compatible audio devices found") : _(L"Searching for Bluetooth audio devices..."));
+		empty.FontSize(14);
+		empty.Foreground(CreateTextBrush(lightTheme, 190));
+		empty.TextWrapping(TextWrapping::Wrap);
+		empty.Margin({ 8, 16, 8, 16 });
+		g_deviceListPanel.Children().Append(empty);
+	}
+	else
+	{
+		for (const auto& device : devices)
+			AddDevicePickerRow(device, lightTheme);
 	}
 }
 
@@ -761,6 +765,59 @@ void SetupDevicePicker()
 	using namespace winrt::Windows::UI::Xaml::Media;
 
 	const bool lightTheme = IsLightTheme();
+	const auto watcherGeneration = ++g_deviceWatcherGeneration;
+	try
+	{
+		if (g_deviceWatcher)
+			g_deviceWatcher.Stop();
+
+		{
+			std::lock_guard lock(g_deviceListMutex);
+			g_availableDevices.clear();
+		}
+		g_deviceEnumerationCompleted = false;
+		g_deviceWatcher = DeviceInformation::CreateWatcher(AudioPlaybackConnection::GetDeviceSelector());
+		g_deviceWatcher.Added([watcherGeneration](const auto&, const auto& device) {
+			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
+				return;
+			{
+				std::lock_guard lock(g_deviceListMutex);
+				g_availableDevices.insert_or_assign(std::wstring(device.Id()), device);
+			}
+			if (IsWindow(g_hWnd))
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+		});
+		g_deviceWatcher.Removed([watcherGeneration](const auto&, const auto& update) {
+			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
+				return;
+			{
+				std::lock_guard lock(g_deviceListMutex);
+				g_availableDevices.erase(std::wstring(update.Id()));
+			}
+			if (IsWindow(g_hWnd))
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+		});
+		g_deviceWatcher.Updated([watcherGeneration](const auto&, const auto&) {
+			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
+				return;
+			if (IsWindow(g_hWnd))
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+		});
+		g_deviceWatcher.EnumerationCompleted([watcherGeneration](const auto&, const auto&) {
+			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
+				return;
+			g_deviceEnumerationCompleted = true;
+			if (IsWindow(g_hWnd))
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+		});
+		g_deviceWatcher.Start();
+	}
+	catch (...)
+	{
+		g_deviceEnumerationCompleted = true;
+		LOG_CAUGHT_EXCEPTION();
+	}
+
 	const auto textBrush = CreateTextBrush(lightTheme);
 	const auto secondaryTextBrush = CreateTextBrush(lightTheme, 185);
 

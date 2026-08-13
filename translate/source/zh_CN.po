@@ -93,3 +93,7 @@ msgstr "未找到兼容的音频设备"
 #: AudioPlaybackConnector.cpp:...
 msgid "Select a Bluetooth audio device"
 msgstr "选择蓝牙音频设备"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Searching for Bluetooth audio devices..."
+msgstr "正在搜索蓝牙音频设备..."

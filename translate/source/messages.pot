@@ -91,3 +91,7 @@ msgstr ""
 #: AudioPlaybackConnector.cpp:...
 msgid "Select a Bluetooth audio device"
 msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Searching for Bluetooth audio devices..."
+msgstr ""
