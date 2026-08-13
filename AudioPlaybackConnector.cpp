@@ -4,13 +4,18 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(std::wstring_view);
-winrt::fire_and_forget ConnectDevice(DeviceInformation);
+winrt::fire_and_forget ConnectDevice(std::wstring);
 void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+
+void QueueDeviceListRefresh()
+{
+	if (!g_shuttingDown && IsWindow(g_hWnd))
+		PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+}
 
 bool IsLightTheme()
 {
@@ -67,6 +72,7 @@ constexpr auto CONNECTION_STATE_SETTLE_DELAY = std::chrono::milliseconds(150);
 
 bool IsCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
+	std::lock_guard lock(g_connectionMutex);
 	auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
 	return it != g_audioPlaybackConnections.end() && it->second.Generation == generation;
 }
@@ -87,6 +93,7 @@ void QueueConnectionStateChanged(std::wstring deviceId, uint64_t generation)
 
 void CloseCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
+	std::lock_guard lock(g_connectionMutex);
 	auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
 	if (it == g_audioPlaybackConnections.end() || it->second.Generation != generation)
 		return;
@@ -192,12 +199,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			g_deviceWatcher.Stop();
 		if (g_reconnect)
 			SaveSettings();
-		for (const auto& connection : g_audioPlaybackConnections)
 		{
-			connection.second.Connection.Close();
+			std::lock_guard lock(g_connectionMutex);
+			for (const auto& connection : g_audioPlaybackConnections)
+				connection.second.Connection.Close();
+			g_audioPlaybackConnections.clear();
+			g_deviceErrorMessages.clear();
 		}
-		g_audioPlaybackConnections.clear();
-		g_deviceErrorMessages.clear();
 		if (!g_reconnect)
 		{
 			SaveSettings();
@@ -276,13 +284,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (!stateChanged || g_shuttingDown)
 			break;
 
-		auto it = g_audioPlaybackConnections.find(stateChanged->deviceId);
-		if (it != g_audioPlaybackConnections.end() &&
-			it->second.Generation == stateChanged->generation &&
-			it->second.Connection.State() == AudioPlaybackConnectionState::Closed)
 		{
+			std::lock_guard lock(g_connectionMutex);
+			auto it = g_audioPlaybackConnections.find(stateChanged->deviceId);
+			if (it == g_audioPlaybackConnections.end() ||
+				it->second.Generation != stateChanged->generation ||
+				it->second.Connection.State() != AudioPlaybackConnectionState::Closed)
+				break;
 			g_audioPlaybackConnections.erase(it);
-			RefreshDevicePicker();
+			QueueDeviceListRefresh();
 		}
 	}
 	break;
@@ -409,7 +419,12 @@ void SetupMenu()
 	exitItem.Text(_(L"Exit"));
 	exitItem.Icon(closeIcon);
 	exitItem.Click([](const auto&, const auto&) {
-		if (g_audioPlaybackConnections.size() == 0)
+		bool hasConnections = false;
+		{
+			std::lock_guard lock(g_connectionMutex);
+			hasConnections = !g_audioPlaybackConnections.empty();
+		}
+		if (!hasConnections)
 		{
 			PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 			return;
@@ -452,22 +467,29 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
-	const auto deviceId = std::wstring(device.Id());
-	g_deviceErrorMessages.erase(deviceId);
-	RefreshDevicePicker();
-
-	auto existing = g_audioPlaybackConnections.find(deviceId);
-	if (existing != g_audioPlaybackConnections.end())
 	{
-		if (existing->second.Connecting)
-			co_return;
-		if (existing->second.Connection.State() == AudioPlaybackConnectionState::Opened)
+		std::lock_guard lock(g_connectionMutex);
+		g_deviceErrorMessages.erase(deviceId);
+	}
+	QueueDeviceListRefresh();
+
+	{
+		std::lock_guard lock(g_connectionMutex);
+		auto existing = g_audioPlaybackConnections.find(deviceId);
+		if (existing != g_audioPlaybackConnections.end())
 		{
-			co_return;
+			if (existing->second.Connecting)
+				co_return;
+			if (existing->second.Connection.State() == AudioPlaybackConnectionState::Opened)
+				co_return;
 		}
-		CloseCurrentConnection(deviceId, existing->second.Generation);
+		if (existing != g_audioPlaybackConnections.end())
+		{
+			existing->second.Connection.Close();
+			g_audioPlaybackConnections.erase(existing);
+		}
 	}
 
 	bool success = false;
@@ -483,7 +505,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		uint64_t generation = 0;
 		try
 		{
-			connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
+			connection = AudioPlaybackConnection::TryCreateFromId(deviceId);
 			if (!connection)
 			{
 				errorMessage = _(L"Unknown error");
@@ -491,10 +513,13 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			}
 
 			generation = ++g_nextConnectionGeneration;
-			g_audioPlaybackConnections.insert_or_assign(deviceId, AudioPlaybackConnectionEntry{
-				device, connection, generation, true
-			});
-			RefreshDevicePicker();
+			{
+				std::lock_guard lock(g_connectionMutex);
+				g_audioPlaybackConnections.insert_or_assign(deviceId, AudioPlaybackConnectionEntry{
+					connection, generation, true
+				});
+			}
+			QueueDeviceListRefresh();
 
 			connection.StateChanged([deviceId, generation](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
@@ -504,27 +529,29 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			// StartAsync configures the system-wide remote audio source. Calling it
 			// repeatedly is known to be unsafe on some Windows 11 builds, so serialize
 			// the first in-flight operation and never start it again in this process.
-			if (!g_audioPlaybackStarted)
+			if (!g_audioPlaybackStarted.load())
 			{
-				while (g_audioPlaybackStartInProgress && !g_audioPlaybackStarted && !g_shuttingDown)
-					co_await winrt::resume_after(std::chrono::milliseconds(50));
-				if (g_shuttingDown)
-					co_return;
-
-				if (!g_audioPlaybackStarted)
+				bool expected = false;
+				if (g_audioPlaybackStartInProgress.compare_exchange_strong(expected, true))
 				{
-					g_audioPlaybackStartInProgress = true;
 					try
 					{
 						co_await connection.StartAsync();
-						g_audioPlaybackStarted = true;
+						g_audioPlaybackStarted.store(true);
 					}
 					catch (...)
 					{
-						g_audioPlaybackStartInProgress = false;
+						g_audioPlaybackStartInProgress.store(false);
 						throw;
 					}
-					g_audioPlaybackStartInProgress = false;
+					g_audioPlaybackStartInProgress.store(false);
+				}
+				else
+				{
+					while (!g_audioPlaybackStarted.load() && g_audioPlaybackStartInProgress.load() && !g_shuttingDown)
+						co_await winrt::resume_after(std::chrono::milliseconds(50));
+					if (g_shuttingDown || !g_audioPlaybackStarted.load())
+						co_return;
 				}
 			}
 			auto result = co_await connection.OpenAsync();
@@ -535,7 +562,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				// Win11 can report a successful open before the audio endpoint has
 				// finished entering the Opened state. Do not expose a false success.
 				co_await winrt::resume_after(CONNECTION_STATE_SETTLE_DELAY);
-				success = IsCurrentConnection(deviceId, generation) &&
+					success = IsCurrentConnection(deviceId, generation) &&
 					connection.State() == AudioPlaybackConnectionState::Opened;
 				if (!success)
 					errorMessage = _(L"Unknown error");
@@ -595,56 +622,56 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 
 	if (success && IsCurrentConnection(deviceId, successfulGeneration))
 	{
-		auto it = g_audioPlaybackConnections.find(deviceId);
-		if (it == g_audioPlaybackConnections.end())
-			co_return;
-		auto& entry = it->second;
-		entry.Connecting = false;
-		g_deviceErrorMessages.erase(deviceId);
+		{
+			std::lock_guard lock(g_connectionMutex);
+			auto it = g_audioPlaybackConnections.find(deviceId);
+			if (it == g_audioPlaybackConnections.end())
+				co_return;
+			it->second.Connecting = false;
+			g_deviceErrorMessages.erase(deviceId);
+		}
 	}
 	else if (!g_shuttingDown)
 	{
+		std::lock_guard lock(g_connectionMutex);
 		g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
 	}
 
-	RefreshDevicePicker();
-}
-
-winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId)
-{
-	try
-	{
-		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
-		if (device)
-			ConnectDevice(device);
-	}
-	catch (...)
-	{
-		LOG_CAUGHT_EXCEPTION();
-	}
+	QueueDeviceListRefresh();
 }
 
 void DisconnectDevice(std::wstring_view deviceId)
 {
-	auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
-	if (it != g_audioPlaybackConnections.end())
 	{
-		it->second.Connection.Close();
-		g_audioPlaybackConnections.erase(it);
+		std::lock_guard lock(g_connectionMutex);
+		auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
+		if (it != g_audioPlaybackConnections.end())
+		{
+			it->second.Connection.Close();
+			g_audioPlaybackConnections.erase(it);
+		}
+		g_deviceErrorMessages.erase(std::wstring(deviceId));
 	}
-	g_deviceErrorMessages.erase(std::wstring(deviceId));
-	RefreshDevicePicker();
+	QueueDeviceListRefresh();
 }
 
-void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
+void AddDevicePickerRow(std::wstring const& deviceId, std::wstring const& deviceName, bool lightTheme)
 {
 	using namespace winrt::Windows::UI::Xaml::Media;
 
-	const auto deviceId = std::wstring(device.Id());
-	auto connection = g_audioPlaybackConnections.find(deviceId);
-	const bool connecting = connection != g_audioPlaybackConnections.end() && connection->second.Connecting;
-	const bool connected = connection != g_audioPlaybackConnections.end() &&
-		connection->second.Connection.State() == AudioPlaybackConnectionState::Opened;
+	bool connecting = false;
+	bool connected = false;
+	std::wstring errorMessage;
+	{
+		std::lock_guard lock(g_connectionMutex);
+		auto connection = g_audioPlaybackConnections.find(deviceId);
+		connecting = connection != g_audioPlaybackConnections.end() && connection->second.Connecting;
+		connected = connection != g_audioPlaybackConnections.end() &&
+			connection->second.Connection.State() == AudioPlaybackConnectionState::Opened;
+		auto error = g_deviceErrorMessages.find(deviceId);
+		if (error != g_deviceErrorMessages.end())
+			errorMessage = error->second;
+	}
 
 	Grid row;
 	row.MinHeight(68);
@@ -676,7 +703,7 @@ void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
 	textPanel.Margin({ 8, 0, 8, 0 });
 
 	TextBlock name;
-	name.Text(device.Name().empty() ? _(L"Unknown device") : device.Name());
+	name.Text(deviceName.empty() ? _(L"Unknown device") : deviceName);
 	name.FontSize(15);
 	name.Foreground(CreateTextBrush(lightTheme));
 	name.TextTrimming(TextTrimming::CharacterEllipsis);
@@ -690,8 +717,7 @@ void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
 		status.Text(_(L"Connected"));
 	else
 	{
-		auto error = g_deviceErrorMessages.find(deviceId);
-		status.Text(error == g_deviceErrorMessages.end() ? _(L"Ready") : error->second);
+		status.Text(errorMessage.empty() ? _(L"Ready") : errorMessage);
 	}
 
 	textPanel.Children().Append(name);
@@ -716,11 +742,11 @@ void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
 		action.Background(SolidColorBrush(lightTheme ? MakeColor(34, 0, 0, 0) : MakeColor(48, 255, 255, 255)));
 		action.Foreground(CreateTextBrush(lightTheme));
 	}
-	action.Click([device, connected](const auto&, const auto&) {
+	action.Click([deviceId, connected](const auto&, const auto&) {
 		if (connected)
-			DisconnectDevice(std::wstring(device.Id()));
+			DisconnectDevice(deviceId);
 		else
-			ConnectDevice(device);
+			ConnectDevice(deviceId);
 	});
 	Grid::SetColumn(action, 2);
 	row.Children().Append(action);
@@ -733,11 +759,11 @@ void RefreshDevicePicker()
 	if (g_shuttingDown || !g_deviceListPanel)
 		return;
 
-	std::vector<DeviceInformation> devices;
+	std::vector<std::pair<std::wstring, std::wstring>> devices;
 	{
 		std::lock_guard lock(g_deviceListMutex);
-		devices.reserve(g_availableDevices.size());
-		for (const auto& [_, device] : g_availableDevices)
+		devices.reserve(g_availableDeviceNames.size());
+		for (const auto& device : g_availableDeviceNames)
 			devices.push_back(device);
 	}
 
@@ -755,8 +781,8 @@ void RefreshDevicePicker()
 	}
 	else
 	{
-		for (const auto& device : devices)
-			AddDevicePickerRow(device, lightTheme);
+		for (const auto& [deviceId, deviceName] : devices)
+			AddDevicePickerRow(deviceId, deviceName, lightTheme);
 	}
 }
 
@@ -773,7 +799,7 @@ void SetupDevicePicker()
 
 		{
 			std::lock_guard lock(g_deviceListMutex);
-			g_availableDevices.clear();
+			g_availableDeviceNames.clear();
 		}
 		g_deviceEnumerationCompleted = false;
 		g_deviceWatcher = DeviceInformation::CreateWatcher(AudioPlaybackConnection::GetDeviceSelector());
@@ -782,7 +808,7 @@ void SetupDevicePicker()
 				return;
 			{
 				std::lock_guard lock(g_deviceListMutex);
-				g_availableDevices.insert_or_assign(std::wstring(device.Id()), device);
+				g_availableDeviceNames.insert_or_assign(std::wstring(device.Id()), std::wstring(device.Name()));
 			}
 			if (IsWindow(g_hWnd))
 				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
@@ -792,7 +818,7 @@ void SetupDevicePicker()
 				return;
 			{
 				std::lock_guard lock(g_deviceListMutex);
-				g_availableDevices.erase(std::wstring(update.Id()));
+				g_availableDeviceNames.erase(std::wstring(update.Id()));
 			}
 			if (IsWindow(g_hWnd))
 				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);

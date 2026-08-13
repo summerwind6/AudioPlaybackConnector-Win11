@@ -53,9 +53,10 @@ void SaveSettings()
 		jsonObj.Insert(L"reconnect", JsonValue::CreateBooleanValue(g_reconnect));
 
 		JsonArray lastDevices;
-		for (const auto& i : g_audioPlaybackConnections)
 		{
-			lastDevices.Append(JsonValue::CreateStringValue(i.first));
+			std::lock_guard lock(g_connectionMutex);
+			for (const auto& i : g_audioPlaybackConnections)
+				lastDevices.Append(JsonValue::CreateStringValue(i.first));
 		}
 		jsonObj.Insert(L"lastDevices", lastDevices);
 

@@ -24,7 +24,6 @@ struct ConnectionStateChangedMessage
 
 struct AudioPlaybackConnectionEntry
 {
-	DeviceInformation Device{ nullptr };
 	AudioPlaybackConnection Connection{ nullptr };
 	uint64_t Generation{};
 	bool Connecting{};
@@ -42,7 +41,8 @@ FocusState g_menuFocusState = FocusState::Unfocused;
 DeviceWatcher g_deviceWatcher = nullptr;
 std::unordered_map<std::wstring, AudioPlaybackConnectionEntry> g_audioPlaybackConnections;
 std::unordered_map<std::wstring, std::wstring> g_deviceErrorMessages;
-std::unordered_map<std::wstring, DeviceInformation> g_availableDevices;
+std::unordered_map<std::wstring, std::wstring> g_availableDeviceNames;
+std::recursive_mutex g_connectionMutex;
 std::mutex g_deviceListMutex;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
@@ -62,8 +62,8 @@ uint64_t g_nextConnectionGeneration = 0;
 std::atomic_uint64_t g_deviceWatcherGeneration = 0;
 std::atomic_bool g_deviceEnumerationCompleted = false;
 std::atomic_bool g_shuttingDown = false;
-bool g_audioPlaybackStarted = false;
-bool g_audioPlaybackStartInProgress = false;
+std::atomic_bool g_audioPlaybackStarted = false;
+std::atomic_bool g_audioPlaybackStartInProgress = false;
 
 #include "Util.hpp"
 #include "I18n.hpp"
