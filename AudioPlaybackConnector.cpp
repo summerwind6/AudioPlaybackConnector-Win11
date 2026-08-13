@@ -284,21 +284,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (!stateChanged || g_shuttingDown)
 			break;
 
-	{
-		std::lock_guard lock(g_connectionMutex);
-		auto it = g_audioPlaybackConnections.find(stateChanged->deviceId);
-		if (it == g_audioPlaybackConnections.end() ||
-			it->second.Generation != stateChanged->generation)
-			break;
-
-		const auto state = it->second.Connection.State();
-		if (state == AudioPlaybackConnectionState::Closed)
+		{
+			std::lock_guard lock(g_connectionMutex);
+			auto it = g_audioPlaybackConnections.find(stateChanged->deviceId);
+			if (it == g_audioPlaybackConnections.end() ||
+				it->second.Generation != stateChanged->generation ||
+				it->second.Connection.State() != AudioPlaybackConnectionState::Closed)
+				break;
 			g_audioPlaybackConnections.erase(it);
-		else if (state == AudioPlaybackConnectionState::Opened)
-			it->second.Connecting = false;
-
-		QueueDeviceListRefresh();
-	}
+			QueueDeviceListRefresh();
+		}
 	}
 	break;
 	case WM_DEVICE_LIST_CHANGED:
@@ -541,15 +536,9 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		if (existing != g_audioPlaybackConnections.end())
 		{
 			if (existing->second.Connecting)
-			{
-				QueueDeviceListRefresh();
 				co_return;
-			}
 			if (existing->second.Connection.State() == AudioPlaybackConnectionState::Opened)
-			{
-				QueueDeviceListRefresh();
 				co_return;
-			}
 		}
 		if (existing != g_audioPlaybackConnections.end())
 		{
@@ -590,10 +579,9 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			}
 			QueueDeviceListRefresh();
 
-			connection.StateChanged([deviceId, generation](const auto&, const auto&) {
-				// The event can arrive on a non-UI thread. The window procedure
-				// reads the state and updates the custom picker on the UI thread.
-				QueueConnectionStateChanged(deviceId, generation);
+			connection.StateChanged([deviceId, generation](const auto& sender, const auto&) {
+				if (sender.State() == AudioPlaybackConnectionState::Closed)
+					QueueConnectionStateChanged(deviceId, generation);
 			});
 
 			// Keep the original order and apartment: enable this connection first,
@@ -670,6 +658,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			auto it = g_audioPlaybackConnections.find(deviceId);
 			if (it == g_audioPlaybackConnections.end())
 				co_return;
+			it->second.Connecting = false;
 			g_deviceErrorMessages.erase(deviceId);
 		}
 	}
