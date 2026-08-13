@@ -22,7 +22,14 @@
 // C++ RunTime Header Files
 #include <cstdlib>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
+#include <memory>
+#include <string>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 #include <filesystem>
 
 // wil
@@ -48,6 +55,8 @@
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
+#include <winrt/Windows.UI.Xaml.Interop.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
 #include <windows.ui.xaml.hosting.desktopwindowxamlsource.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 

@@ -13,6 +13,21 @@ namespace fs = std::filesystem;
 
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
+constexpr UINT WM_CONNECTION_STATE_CHANGED = WM_APP + 3;
+
+struct ConnectionStateChangedMessage
+{
+	std::wstring deviceId;
+	uint64_t generation{};
+};
+
+struct AudioPlaybackConnectionEntry
+{
+	DeviceInformation Device{ nullptr };
+	AudioPlaybackConnection Connection{ nullptr };
+	uint64_t Generation{};
+	bool Connecting{};
+};
 
 HINSTANCE g_hInst;
 HWND g_hWnd;
@@ -22,7 +37,7 @@ Flyout g_xamlFlyout = nullptr;
 MenuFlyout g_xamlMenu = nullptr;
 FocusState g_menuFocusState = FocusState::Unfocused;
 DevicePicker g_devicePicker = nullptr;
-std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
+std::unordered_map<std::wstring, AudioPlaybackConnectionEntry> g_audioPlaybackConnections;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
 NOTIFYICONDATAW g_nid = {
@@ -37,6 +52,10 @@ NOTIFYICONIDENTIFIER g_niid = {
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
 std::vector<std::wstring> g_lastDevices;
+uint64_t g_nextConnectionGeneration = 0;
+std::atomic_bool g_shuttingDown = false;
+bool g_audioPlaybackStarted = false;
+bool g_audioPlaybackStartInProgress = false;
 
 #include "Util.hpp"
 #include "I18n.hpp"
