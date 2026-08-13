@@ -526,34 +526,9 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 					QueueConnectionStateChanged(deviceId, generation);
 			});
 
-			// StartAsync configures the system-wide remote audio source. Calling it
-			// repeatedly is known to be unsafe on some Windows 11 builds, so serialize
-			// the first in-flight operation and never start it again in this process.
-			if (!g_audioPlaybackStarted.load())
-			{
-				bool expected = false;
-				if (g_audioPlaybackStartInProgress.compare_exchange_strong(expected, true))
-				{
-					try
-					{
-						co_await connection.StartAsync();
-						g_audioPlaybackStarted.store(true);
-					}
-					catch (...)
-					{
-						g_audioPlaybackStartInProgress.store(false);
-						throw;
-					}
-					g_audioPlaybackStartInProgress.store(false);
-				}
-				else
-				{
-					while (!g_audioPlaybackStarted.load() && g_audioPlaybackStartInProgress.load() && !g_shuttingDown)
-						co_await winrt::resume_after(std::chrono::milliseconds(50));
-					if (g_shuttingDown || !g_audioPlaybackStarted.load())
-						co_return;
-				}
-			}
+			// The system binds enabling to this AudioPlaybackConnection instance.
+			// A retry creates a new instance, so it must be enabled again before open.
+			co_await connection.StartAsync();
 			auto result = co_await connection.OpenAsync();
 
 			switch (result.Status())

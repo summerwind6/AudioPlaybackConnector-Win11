@@ -62,8 +62,6 @@ uint64_t g_nextConnectionGeneration = 0;
 std::atomic_uint64_t g_deviceWatcherGeneration = 0;
 std::atomic_bool g_deviceEnumerationCompleted = false;
 std::atomic_bool g_shuttingDown = false;
-std::atomic_bool g_audioPlaybackStarted = false;
-std::atomic_bool g_audioPlaybackStartInProgress = false;
 
 #include "Util.hpp"
 #include "I18n.hpp"
