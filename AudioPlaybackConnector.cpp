@@ -4,7 +4,10 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
+winrt::fire_and_forget ConnectDevice(std::wstring_view);
+winrt::fire_and_forget ConnectDevice(DeviceInformation);
+winrt::fire_and_forget RefreshDevicePicker();
+void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
@@ -82,17 +85,14 @@ void QueueConnectionStateChanged(std::wstring deviceId, uint64_t generation)
 		message.release();
 }
 
-void CloseCurrentConnection(std::wstring_view deviceId, uint64_t generation, bool resetDisplayStatus)
+void CloseCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
 	auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
 	if (it == g_audioPlaybackConnections.end() || it->second.Generation != generation)
 		return;
 
-	auto device = it->second.Device;
 	it->second.Connection.Close();
 	g_audioPlaybackConnections.erase(it);
-	if (resetDisplayStatus)
-		g_devicePicker.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
 }
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -193,9 +193,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		for (const auto& connection : g_audioPlaybackConnections)
 		{
 			connection.second.Connection.Close();
-			g_devicePicker.SetDisplayStatus(connection.second.Device, {}, DevicePickerDisplayStatusOptions::None);
 		}
 		g_audioPlaybackConnections.clear();
+		g_deviceErrorMessages.clear();
 		if (!g_reconnect)
 		{
 			SaveSettings();
@@ -209,6 +209,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			UpdateNotifyIcon();
 			SetupFlyout();
 			SetupMenu();
+			SetupDevicePicker();
 		}
 		break;
 	case WM_NOTIFYICON:
@@ -235,9 +236,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
 			};
 
-			SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_HIDEWINDOW);
+			SetWindowPos(g_hWndXaml, 0, 0, 0, 0, 0, SWP_NOZORDER | SWP_SHOWWINDOW);
+			SetWindowPos(hWnd, HWND_TOPMOST, iconRect.left, iconRect.top, 1, 1, SWP_SHOWWINDOW);
 			SetForegroundWindow(hWnd);
-			g_devicePicker.Show(rect, Placement::Above);
+			g_xamlCanvas.Width(rect.Width);
+			g_xamlCanvas.Height(rect.Height);
+			RefreshDevicePicker();
+			g_xamlDeviceFlyout.ShowAt(g_xamlCanvas);
 		}
 		break;
 		case WM_RBUTTONUP: // Menu activated by mouse click
@@ -274,9 +279,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			it->second.Generation == stateChanged->generation &&
 			it->second.Connection.State() == AudioPlaybackConnectionState::Closed)
 		{
-			auto device = it->second.Device;
 			g_audioPlaybackConnections.erase(it);
-			g_devicePicker.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+			RefreshDevicePicker();
 		}
 	}
 	break;
@@ -285,7 +289,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			for (const auto& i : g_lastDevices)
 			{
-				ConnectDevice(g_devicePicker, i);
+				ConnectDevice(i);
 			}
 			g_lastDevices.clear();
 		}
@@ -443,9 +447,12 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	const auto deviceId = std::wstring(device.Id());
+	g_deviceErrorMessages.erase(deviceId);
+	RefreshDevicePicker();
+
 	auto existing = g_audioPlaybackConnections.find(deviceId);
 	if (existing != g_audioPlaybackConnections.end())
 	{
@@ -453,13 +460,10 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			co_return;
 		if (existing->second.Connection.State() == AudioPlaybackConnectionState::Opened)
 		{
-			picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 			co_return;
 		}
-		CloseCurrentConnection(deviceId, existing->second.Generation, false);
+		CloseCurrentConnection(deviceId, existing->second.Generation);
 	}
-
-	picker.SetDisplayStatus(device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
 
 	bool success = false;
 	uint64_t successfulGeneration = 0;
@@ -485,6 +489,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			g_audioPlaybackConnections.insert_or_assign(deviceId, AudioPlaybackConnectionEntry{
 				device, connection, generation, true
 			});
+			RefreshDevicePicker();
 
 			connection.StateChanged([deviceId, generation](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
@@ -575,9 +580,12 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			break;
 		}
 
-		if (!IsCurrentConnection(deviceId, generation))
-			co_return;
-		CloseCurrentConnection(deviceId, generation, false);
+		if (generation != 0)
+		{
+			if (!IsCurrentConnection(deviceId, generation))
+				co_return;
+			CloseCurrentConnection(deviceId, generation);
+		}
 	}
 
 	if (success && IsCurrentConnection(deviceId, successfulGeneration))
@@ -587,19 +595,160 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			co_return;
 		auto& entry = it->second;
 		entry.Connecting = false;
-		picker.SetDisplayStatus(device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		g_deviceErrorMessages.erase(deviceId);
 	}
 	else if (!g_shuttingDown)
-		picker.SetDisplayStatus(device, errorMessage.empty() ? _(L"Unknown error") : errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+	{
+		g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
+	}
+
+	RefreshDevicePicker();
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring_view deviceId)
 {
 	try
 	{
 		auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
 		if (device)
-			ConnectDevice(picker, device);
+			ConnectDevice(device);
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+void DisconnectDevice(std::wstring_view deviceId)
+{
+	auto it = g_audioPlaybackConnections.find(std::wstring(deviceId));
+	if (it != g_audioPlaybackConnections.end())
+	{
+		it->second.Connection.Close();
+		g_audioPlaybackConnections.erase(it);
+	}
+	g_deviceErrorMessages.erase(std::wstring(deviceId));
+	RefreshDevicePicker();
+}
+
+void AddDevicePickerRow(DeviceInformation const& device, bool lightTheme)
+{
+	using namespace winrt::Windows::UI::Xaml::Media;
+
+	const auto deviceId = std::wstring(device.Id());
+	auto connection = g_audioPlaybackConnections.find(deviceId);
+	const bool connecting = connection != g_audioPlaybackConnections.end() && connection->second.Connecting;
+	const bool connected = connection != g_audioPlaybackConnections.end() &&
+		connection->second.Connection.State() == AudioPlaybackConnectionState::Opened;
+
+	Grid row;
+	row.MinHeight(68);
+	row.Padding({ 8, 6, 8, 6 });
+	row.CornerRadius({ 8, 8, 8, 8 });
+	row.Background(SolidColorBrush(lightTheme ? MakeColor(24, 0, 0, 0) : MakeColor(32, 255, 255, 255)));
+
+	ColumnDefinition iconColumn;
+	iconColumn.Width(GridLength{ 44, GridUnitType::Pixel });
+	ColumnDefinition textColumn;
+	textColumn.Width(GridLength{ 1, GridUnitType::Star });
+	ColumnDefinition actionColumn;
+	actionColumn.Width(GridLength{ 110, GridUnitType::Pixel });
+	row.ColumnDefinitions().Append(iconColumn);
+	row.ColumnDefinitions().Append(textColumn);
+	row.ColumnDefinitions().Append(actionColumn);
+
+	FontIcon deviceIcon;
+	deviceIcon.Glyph(L"\xE702");
+	deviceIcon.FontSize(24);
+	deviceIcon.Foreground(SolidColorBrush(MakeColor(255, 0, 103, 192)));
+	deviceIcon.HorizontalAlignment(HorizontalAlignment::Center);
+	deviceIcon.VerticalAlignment(VerticalAlignment::Center);
+	Grid::SetColumn(deviceIcon, 0);
+	row.Children().Append(deviceIcon);
+
+	StackPanel textPanel;
+	textPanel.VerticalAlignment(VerticalAlignment::Center);
+	textPanel.Margin({ 8, 0, 8, 0 });
+
+	TextBlock name;
+	name.Text(device.Name().empty() ? _(L"Unknown device") : device.Name());
+	name.FontSize(15);
+	name.Foreground(CreateTextBrush(lightTheme));
+	name.TextTrimming(TextTrimming::CharacterEllipsis);
+
+	TextBlock status;
+	status.FontSize(13);
+	status.Foreground(CreateTextBrush(lightTheme, 175));
+	if (connecting)
+		status.Text(_(L"Connecting"));
+	else if (connected)
+		status.Text(_(L"Connected"));
+	else
+	{
+		auto error = g_deviceErrorMessages.find(deviceId);
+		status.Text(error == g_deviceErrorMessages.end() ? _(L"Ready") : error->second);
+	}
+
+	textPanel.Children().Append(name);
+	textPanel.Children().Append(status);
+	Grid::SetColumn(textPanel, 1);
+	row.Children().Append(textPanel);
+
+	Button action;
+	action.MinWidth(104);
+	action.Padding({ 12, 6, 12, 6 });
+	action.FontSize(13);
+	action.CornerRadius({ 6, 6, 6, 6 });
+	action.IsEnabled(!connecting);
+	action.Content(winrt::box_value(connected ? _(L"Disconnect") : connecting ? _(L"Connecting") : _(L"Connect")));
+	if (connected)
+	{
+		action.Background(SolidColorBrush(MakeColor(255, 0, 103, 192)));
+		action.Foreground(SolidColorBrush(MakeColor(255, 255, 255, 255)));
+	}
+	else
+	{
+		action.Background(SolidColorBrush(lightTheme ? MakeColor(34, 0, 0, 0) : MakeColor(48, 255, 255, 255)));
+		action.Foreground(CreateTextBrush(lightTheme));
+	}
+	action.Click([device, connected](const auto&, const auto&) {
+		if (connected)
+			DisconnectDevice(std::wstring(device.Id()));
+		else
+			ConnectDevice(device);
+	});
+	Grid::SetColumn(action, 2);
+	row.Children().Append(action);
+
+	g_deviceListPanel.Children().Append(row);
+}
+
+winrt::fire_and_forget RefreshDevicePicker()
+{
+	const auto refreshGeneration = ++g_deviceListRefreshGeneration;
+	try
+	{
+		auto devices = co_await DeviceInformation::FindAllAsync(AudioPlaybackConnection::GetDeviceSelector());
+		if (g_shuttingDown || refreshGeneration != g_deviceListRefreshGeneration || !g_deviceListPanel)
+			co_return;
+
+		const bool lightTheme = IsLightTheme();
+		g_deviceListPanel.Children().Clear();
+		if (devices.Size() == 0)
+		{
+			TextBlock empty;
+			empty.Text(_(L"No compatible audio devices found"));
+			empty.FontSize(14);
+			empty.Foreground(CreateTextBrush(lightTheme, 190));
+			empty.TextWrapping(TextWrapping::Wrap);
+			empty.Margin({ 8, 16, 8, 16 });
+			g_deviceListPanel.Children().Append(empty);
+		}
+		else
+		{
+			for (const auto& device : devices)
+				AddDevicePickerRow(device, lightTheme);
+		}
 	}
 	catch (...)
 	{
@@ -609,26 +758,100 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view devi
 
 void SetupDevicePicker()
 {
-	g_devicePicker = DevicePicker();
-	winrt::check_hresult(g_devicePicker.as<IInitializeWithWindow>()->Initialize(g_hWnd));
+	using namespace winrt::Windows::UI::Xaml::Media;
 
-	g_devicePicker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
-	g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
-		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0, SWP_NOZORDER | SWP_HIDEWINDOW);
+	const bool lightTheme = IsLightTheme();
+	const auto textBrush = CreateTextBrush(lightTheme);
+	const auto secondaryTextBrush = CreateTextBrush(lightTheme, 185);
+
+	FontIcon bluetoothIcon;
+	bluetoothIcon.Glyph(L"\xE702");
+	bluetoothIcon.FontSize(24);
+	bluetoothIcon.Foreground(SolidColorBrush(MakeColor(255, 0, 103, 192)));
+	bluetoothIcon.Margin({ 0, 0, 10, 0 });
+
+	TextBlock title;
+	title.Text(_(L"Connect"));
+	title.FontSize(20);
+	title.FontWeight({ 600 });
+	title.Foreground(textBrush);
+
+	StackPanel titlePanel;
+	titlePanel.Orientation(Orientation::Horizontal);
+	titlePanel.VerticalAlignment(VerticalAlignment::Center);
+	titlePanel.Children().Append(bluetoothIcon);
+	titlePanel.Children().Append(title);
+
+	TextBlock subtitle;
+	subtitle.Text(_(L"Select a Bluetooth audio device"));
+	subtitle.FontSize(13);
+	subtitle.Foreground(secondaryTextBrush);
+	subtitle.Margin({ 0, 4, 0, 0 });
+
+	g_deviceListPanel = StackPanel();
+	g_deviceListPanel.Spacing(6);
+
+	ScrollViewer deviceScroll;
+	deviceScroll.MaxHeight(420);
+	deviceScroll.Margin({ 0, 16, 0, 16 });
+	deviceScroll.VerticalScrollBarVisibility(ScrollBarVisibility::Auto);
+	deviceScroll.Content(g_deviceListPanel);
+
+	Button settingsButton;
+	settingsButton.Content(winrt::box_value(_(L"Bluetooth Settings")));
+	settingsButton.FontSize(13);
+	settingsButton.Padding({ 12, 7, 12, 7 });
+	settingsButton.CornerRadius({ 6, 6, 6, 6 });
+	settingsButton.Background(SolidColorBrush(lightTheme ? MakeColor(34, 0, 0, 0) : MakeColor(48, 255, 255, 255)));
+	settingsButton.Foreground(textBrush);
+	settingsButton.Click([](const auto&, const auto&) {
+		winrt::Windows::System::Launcher::LaunchUriAsync(Uri(L"ms-settings:bluetooth"));
 	});
-	g_devicePicker.DeviceSelected([](const auto& sender, const auto& args) {
-		ConnectDevice(sender, args.SelectedDevice());
+
+	Button cancelButton;
+	cancelButton.Content(winrt::box_value(_(L"Cancel")));
+	cancelButton.FontSize(13);
+	cancelButton.FontWeight({ 600 });
+	cancelButton.Padding({ 16, 7, 16, 7 });
+	cancelButton.CornerRadius({ 6, 6, 6, 6 });
+	cancelButton.Background(SolidColorBrush(MakeColor(255, 0, 103, 192)));
+	cancelButton.Foreground(SolidColorBrush(MakeColor(255, 255, 255, 255)));
+	cancelButton.Click([](const auto&, const auto&) {
+		g_xamlDeviceFlyout.Hide();
 	});
-	g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
-		auto device = args.Device();
-		auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-		if (it != g_audioPlaybackConnections.end())
-		{
-			it->second.Connection.Close();
-			g_audioPlaybackConnections.erase(it);
-		}
-		sender.SetDisplayStatus(device, {}, DevicePickerDisplayStatusOptions::None);
+
+	StackPanel footer;
+	footer.Orientation(Orientation::Horizontal);
+	footer.HorizontalAlignment(HorizontalAlignment::Right);
+	footer.Spacing(8);
+	footer.Children().Append(settingsButton);
+	footer.Children().Append(cancelButton);
+
+	StackPanel content;
+	content.Width(420);
+	content.Padding({ 20, 18, 20, 18 });
+	content.Children().Append(titlePanel);
+	content.Children().Append(subtitle);
+	content.Children().Append(deviceScroll);
+	content.Children().Append(footer);
+
+	Border card;
+	card.Background(CreateWin11SurfaceBrush(lightTheme));
+	card.CornerRadius({ 12, 12, 12, 12 });
+	card.BorderBrush(SolidColorBrush(lightTheme ? MakeColor(90, 255, 255, 255) : MakeColor(90, 255, 255, 255)));
+	card.BorderThickness({ 1, 1, 1, 1 });
+	card.Shadow(ThemeShadow());
+	card.Child(content);
+
+	Flyout flyout;
+	flyout.ShouldConstrainToRootBounds(false);
+	flyout.Placement(winrt::Windows::UI::Xaml::Controls::Primitives::FlyoutPlacementMode::Top);
+	flyout.Content(card);
+	flyout.Closed([](const auto&, const auto&) {
+		ShowWindow(g_hWnd, SW_HIDE);
 	});
+
+	g_xamlDeviceFlyout = flyout;
 }
 
 void SetupSvgIcon()
