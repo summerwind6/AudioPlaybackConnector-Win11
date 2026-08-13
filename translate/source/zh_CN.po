@@ -69,3 +69,27 @@ msgstr "未知错误"
 #: AudioPlaybackConnector.cpp:362
 msgid "Connected"
 msgstr "已连接"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Connect"
+msgstr "连接"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Disconnect"
+msgstr "断开连接"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Cancel"
+msgstr "取消"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Ready"
+msgstr "就绪"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "No compatible audio devices found"
+msgstr "未找到兼容的音频设备"
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Select a Bluetooth audio device"
+msgstr "选择蓝牙音频设备"

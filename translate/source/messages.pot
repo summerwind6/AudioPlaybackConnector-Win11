@@ -67,3 +67,27 @@ msgstr ""
 #: AudioPlaybackConnector.cpp:362
 msgid "Connected"
 msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Connect"
+msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Disconnect"
+msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Cancel"
+msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Ready"
+msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "No compatible audio devices found"
+msgstr ""
+
+#: AudioPlaybackConnector.cpp:...
+msgid "Select a Bluetooth audio device"
+msgstr ""
