@@ -1,116 +1,113 @@
-name: Build
+name: Build and release
 
 on:
   push:
-    tags: [ '**' ]
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: Build ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            platform: x86
+            asset: Release/AudioPlaybackConnector32.exe
+          - arch: x64
+            platform: x64
+            asset: x64/Release/AudioPlaybackConnector64.exe
+          - arch: ARM64
+            platform: ARM64
+            asset: ARM64/Release/AudioPlaybackConnectorARM64.exe
+
     steps:
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
-    - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v1.0.0
-    - uses: nuget/setup-nuget@v1
-      with:
-        nuget-version: latest
-    - uses: actions/setup-python@v1
-      with:
-        python-version: 3.7
-    - run: |
-        cd translate
-        pip install -r requirements.txt
-        ./gen_rc.sh
-      shell: bash
-    - run: nuget restore AudioPlaybackConnector.sln
-    - run: |
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=x64" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=x86" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=ARM64" }
-        Start-Job -Init ([ScriptBlock]::Create("Set-Location '$pwd'")) -Script {
-          msbuild AudioPlaybackConnector.sln "-p:Configuration=Release;Platform=ARM" }
-        Get-Job | Wait-Job | Receive-Job
-      shell: powershell
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnector64
-        path: x64/Release/AudioPlaybackConnector64.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnector64
-        path: x64/Release/AudioPlaybackConnector64.pdb
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnector32
-        path: Release/AudioPlaybackConnector32.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnector32
-        path: Release/AudioPlaybackConnector32.pdb
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM64
-        path: ARM64/Release/AudioPlaybackConnectorARM64.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM64
-        path: ARM64/Release/AudioPlaybackConnectorARM64.pdb
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM
-        path: ARM/Release/AudioPlaybackConnectorARM.exe
-    - uses: actions/upload-artifact@v2
-      with:
-        name: AudioPlaybackConnectorARM
-        path: ARM/Release/AudioPlaybackConnectorARM.pdb
-    - name: Create Release
-      id: create_release
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: ${{ github.ref }}
-        draft: true
-        prerelease: false
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: x64/Release/AudioPlaybackConnector64.exe
-        asset_name: AudioPlaybackConnector64.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: Release/AudioPlaybackConnector32.exe
-        asset_name: AudioPlaybackConnector32.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ARM64/Release/AudioPlaybackConnectorARM64.exe
-        asset_name: AudioPlaybackConnectorARM64.exe
-        asset_content_type: application/octet-stream
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ARM/Release/AudioPlaybackConnectorARM.exe
-        asset_name: AudioPlaybackConnectorARM.exe
-        asset_content_type: application/octet-stream
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore packages
+        run: nuget restore AudioPlaybackConnector.sln
+
+      - name: Build release binary
+        run: >-
+          msbuild AudioPlaybackConnector.sln
+          -m
+          "-p:Configuration=Release;Platform=${{ matrix.platform }};PlatformToolset=v143"
+
+      - name: Upload ${{ matrix.arch }} binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioPlaybackConnector-${{ matrix.arch }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: windows-2022
+
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release-assets -Filter *.exe |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content release-assets/SHA256SUMS.txt -Encoding ascii
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @'
+          ## AudioPlaybackConnector Win11 v1.4.0
+
+          Windows 10 2004+ / Windows 11 Bluetooth A2DP Sink connector.
+
+          ### Improvements
+
+          - Added a Windows 11-style custom Bluetooth device picker.
+          - Improved Windows 11 audio connection compatibility and lifecycle cleanup.
+          - Fixed device-list refresh, cross-thread watcher shutdown, and several connection crashes.
+          - Added clearer connection states and error messages.
+
+          ### Downloads
+
+          - `AudioPlaybackConnector64.exe`: x64 / AMD64, for most Intel and AMD PCs.
+          - `AudioPlaybackConnector32.exe`: x86, for 32-bit Windows.
+          - `AudioPlaybackConnectorARM64.exe`: for Windows on ARM devices.
+          - `SHA256SUMS.txt`: SHA-256 checksums for all binaries.
+
+          ### Known issue
+
+          When **Reconnect on next start** is disabled, the first manual connection after restarting the app may establish without audio. Disconnecting and connecting once more restores audio.
+
+          Based on the original open-source project by Richard Yu (ysc3839).
+          '@ | Set-Content release-notes.md -Encoding utf8
+
+          $assets = Get-ChildItem release-assets -File | Select-Object -ExpandProperty FullName
+          gh release create $env:GITHUB_REF_NAME $assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --title "AudioPlaybackConnector Win11 v1.4.0" `
+            --notes-file release-notes.md `
+            --latest
