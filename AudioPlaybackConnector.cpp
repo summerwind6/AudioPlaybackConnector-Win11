@@ -69,6 +69,9 @@ void ApplyWin11MenuStyle(MenuFlyout& menu, bool lightTheme)
 
 constexpr int MAX_CONNECTION_ATTEMPTS = 3;
 constexpr auto CONNECTION_RETRY_DELAY = std::chrono::milliseconds(400);
+constexpr auto CONNECTION_OPERATION_POLL_INTERVAL = std::chrono::milliseconds(100);
+constexpr auto CONNECTION_START_TIMEOUT = std::chrono::seconds(10);
+constexpr auto CONNECTION_OPEN_TIMEOUT = std::chrono::seconds(20);
 
 bool IsCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
@@ -585,12 +588,43 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 					QueueConnectionStateChanged(deviceId, generation);
 			});
 
-			// Keep the original order and apartment: enable this connection first,
-			// then open it. A retry creates a fresh connection and repeats both.
-			co_await connection.StartAsync();
+			// Keep the original enable/open order, but do not let a Windows Bluetooth
+			// operation leave the custom picker permanently stuck in "Connecting".
+			auto startOperation = connection.StartAsync();
+			const auto startDeadline = std::chrono::steady_clock::now() + CONNECTION_START_TIMEOUT;
+			while (startOperation.Status() == AsyncStatus::Started &&
+				std::chrono::steady_clock::now() < startDeadline && !g_shuttingDown)
+				co_await winrt::resume_after(CONNECTION_OPERATION_POLL_INTERVAL);
 			co_await uiContext;
-			auto result = co_await connection.OpenAsync();
+			if (g_shuttingDown)
+			{
+				startOperation.Cancel();
+				co_return;
+			}
+			if (startOperation.Status() == AsyncStatus::Started)
+			{
+				startOperation.Cancel();
+				winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+			}
+			startOperation.GetResults();
+
+			auto openOperation = connection.OpenAsync();
+			const auto openDeadline = std::chrono::steady_clock::now() + CONNECTION_OPEN_TIMEOUT;
+			while (openOperation.Status() == AsyncStatus::Started &&
+				std::chrono::steady_clock::now() < openDeadline && !g_shuttingDown)
+				co_await winrt::resume_after(CONNECTION_OPERATION_POLL_INTERVAL);
 			co_await uiContext;
+			if (g_shuttingDown)
+			{
+				openOperation.Cancel();
+				co_return;
+			}
+			if (openOperation.Status() == AsyncStatus::Started)
+			{
+				openOperation.Cancel();
+				winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+			}
+			auto result = openOperation.GetResults();
 
 			switch (result.Status())
 			{
@@ -609,8 +643,14 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::UnknownFailure:
 				success = false;
-				LOG_HR(result.ExtendedError());
-				errorMessage = _(L"Unknown error");
+				{
+					const auto extendedError = result.ExtendedError();
+					LOG_HR(extendedError);
+					wchar_t errorCode[16]{};
+					swprintf_s(errorCode, L" (0x%08X)", static_cast<uint32_t>(extendedError));
+					errorMessage = _(L"Unknown error");
+					errorMessage += errorCode;
+				}
 				break;
 			}
 		}
