@@ -9,8 +9,12 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation);
 void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
+void StartDeviceWatcher();
+void StopDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
+
+constexpr WPARAM DEVICE_LIST_ENUMERATION_COMPLETED = 1;
 
 void QueueDeviceListRefresh()
 {
@@ -195,8 +199,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 		g_shuttingDown = true;
-		if (g_deviceWatcher)
-			g_deviceWatcher.Stop();
+		StopDeviceWatcher();
 		if (g_reconnect)
 			SaveSettings();
 		{
@@ -219,6 +222,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			UpdateNotifyIcon();
 			SetupFlyout();
 			SetupMenu();
+			StopDeviceWatcher();
 			SetupDevicePicker();
 		}
 		break;
@@ -251,6 +255,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SetForegroundWindow(hWnd);
 			g_xamlCanvas.Width(rect.Width);
 			g_xamlCanvas.Height(rect.Height);
+			StartDeviceWatcher();
 			RefreshDevicePicker();
 			g_xamlDeviceFlyout.ShowAt(g_xamlCanvas);
 		}
@@ -298,6 +303,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	break;
 	case WM_DEVICE_LIST_CHANGED:
 		RefreshDevicePicker();
+		if (wParam == DEVICE_LIST_ENUMERATION_COMPLETED)
+			StopDeviceWatcher();
 		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
@@ -577,7 +584,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 					connection, generation, true
 				});
 			}
-			QueueDeviceListRefresh();
+			RefreshDevicePicker();
 
 			connection.StateChanged([deviceId, generation](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
@@ -668,7 +675,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
 	}
 
-	QueueDeviceListRefresh();
+	RefreshDevicePicker();
 }
 
 void DisconnectDevice(std::wstring_view deviceId)
@@ -697,8 +704,9 @@ void AddDevicePickerRow(std::wstring const& deviceId, std::wstring const& device
 		std::lock_guard lock(g_connectionMutex);
 		auto connection = g_audioPlaybackConnections.find(deviceId);
 		connecting = connection != g_audioPlaybackConnections.end() && connection->second.Connecting;
-		connected = connection != g_audioPlaybackConnections.end() &&
-			connection->second.Connection.State() == AudioPlaybackConnectionState::Opened;
+		// UI status is derived from the completed connection operation. Avoid
+		// querying the WinRT audio object merely to repaint the custom picker.
+		connected = connection != g_audioPlaybackConnections.end() && !connecting;
 		auto error = g_deviceErrorMessages.find(deviceId);
 		if (error != g_deviceErrorMessages.end())
 			errorMessage = error->second;
@@ -817,17 +825,32 @@ void RefreshDevicePicker()
 	}
 }
 
-void SetupDevicePicker()
+void StopDeviceWatcher()
 {
-	using namespace winrt::Windows::UI::Xaml::Media;
+	++g_deviceWatcherGeneration;
+	if (!g_deviceWatcher)
+		return;
 
-	const bool lightTheme = IsLightTheme();
+	try
+	{
+		const auto status = g_deviceWatcher.Status();
+		if (status == DeviceWatcherStatus::Started ||
+			status == DeviceWatcherStatus::EnumerationCompleted)
+			g_deviceWatcher.Stop();
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	g_deviceWatcher = nullptr;
+}
+
+void StartDeviceWatcher()
+{
+	StopDeviceWatcher();
 	const auto watcherGeneration = ++g_deviceWatcherGeneration;
 	try
 	{
-		if (g_deviceWatcher)
-			g_deviceWatcher.Stop();
-
 		{
 			std::lock_guard lock(g_deviceListMutex);
 			g_availableDeviceNames.clear();
@@ -865,7 +888,7 @@ void SetupDevicePicker()
 				return;
 			g_deviceEnumerationCompleted = true;
 			if (IsWindow(g_hWnd))
-				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, DEVICE_LIST_ENUMERATION_COMPLETED, 0);
 		});
 		g_deviceWatcher.Start();
 	}
@@ -874,6 +897,13 @@ void SetupDevicePicker()
 		g_deviceEnumerationCompleted = true;
 		LOG_CAUGHT_EXCEPTION();
 	}
+}
+
+void SetupDevicePicker()
+{
+	using namespace winrt::Windows::UI::Xaml::Media;
+
+	const bool lightTheme = IsLightTheme();
 
 	const auto textBrush = CreateTextBrush(lightTheme);
 	const auto secondaryTextBrush = CreateTextBrush(lightTheme, 185);
@@ -962,6 +992,7 @@ void SetupDevicePicker()
 	flyout.Placement(winrt::Windows::UI::Xaml::Controls::Primitives::FlyoutPlacementMode::Top);
 	flyout.Content(card);
 	flyout.Closed([](const auto&, const auto&) {
+		StopDeviceWatcher();
 		ShowWindow(g_hWnd, SW_HIDE);
 	});
 
