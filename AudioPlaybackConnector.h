@@ -15,6 +15,8 @@ constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_CONNECTION_STATE_CHANGED = WM_APP + 3;
 constexpr UINT WM_DEVICE_LIST_CHANGED = WM_APP + 4;
+constexpr UINT_PTR SHUTDOWN_TIMER_ID = 1;
+constexpr UINT SHUTDOWN_RELEASE_DELAY_MS = 2000;
 
 struct ConnectionStateChangedMessage
 {
@@ -62,7 +64,6 @@ uint64_t g_nextConnectionGeneration = 0;
 std::atomic_uint64_t g_deviceWatcherGeneration = 0;
 std::atomic_bool g_deviceEnumerationCompleted = false;
 std::atomic_bool g_devicePickerVisible = false;
-std::atomic_bool g_initialAudioSinkActivationPending = true;
 std::atomic_bool g_shuttingDown = false;
 
 #include "Util.hpp"

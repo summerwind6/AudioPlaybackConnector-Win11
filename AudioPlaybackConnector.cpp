@@ -67,13 +67,6 @@ void ApplyWin11MenuStyle(MenuFlyout& menu, bool lightTheme)
 	menu.MenuFlyoutPresenterStyle(presenterStyle);
 }
 
-constexpr int MAX_CONNECTION_ATTEMPTS = 3;
-constexpr auto CONNECTION_RETRY_DELAY = std::chrono::milliseconds(400);
-constexpr auto AUDIO_SINK_RELEASE_DELAY = std::chrono::seconds(2);
-constexpr auto CONNECTION_OPERATION_POLL_INTERVAL = std::chrono::milliseconds(100);
-constexpr auto CONNECTION_START_TIMEOUT = std::chrono::seconds(10);
-constexpr auto CONNECTION_OPEN_TIMEOUT = std::chrono::seconds(20);
-
 bool IsCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
 	std::lock_guard lock(g_connectionMutex);
@@ -197,22 +190,68 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch (message)
 	{
-	case WM_DESTROY:
-		g_shuttingDown = true;
+	case WM_CLOSE:
+	{
+		if (g_shuttingDown.exchange(true))
+			break;
+
 		if (g_deviceWatcher)
-			g_deviceWatcher.Stop();
+		{
+			try
+			{
+				g_deviceWatcher.Stop();
+			}
+			catch (...)
+			{
+				LOG_CAUGHT_EXCEPTION();
+			}
+			g_deviceWatcher = nullptr;
+		}
+
+		// Preserve the connected device IDs before releasing the connections only
+		// when automatic reconnect was requested. Otherwise save an empty list.
 		if (g_reconnect)
 			SaveSettings();
+
+		bool releasedConnections = false;
+		{
+			std::lock_guard lock(g_connectionMutex);
+			releasedConnections = !g_audioPlaybackConnections.empty();
+			for (const auto& connection : g_audioPlaybackConnections)
+				connection.second.Connection.Close();
+			g_audioPlaybackConnections.clear();
+			g_deviceErrorMessages.clear();
+		}
+
+		if (!g_reconnect)
+			SaveSettings();
+
+		// AudioPlaybackConnection releases the underlying Bluetooth transport
+		// asynchronously. Keep the process alive briefly after dropping the final
+		// reference so Windows can finish deactivating the A2DP sink cleanly.
+		Shell_NotifyIconW(NIM_DELETE, &g_nid);
+		ShowWindow(hWnd, SW_HIDE);
+		if (releasedConnections && SetTimer(hWnd, SHUTDOWN_TIMER_ID, SHUTDOWN_RELEASE_DELAY_MS, nullptr))
+			break;
+
+		DestroyWindow(hWnd);
+	}
+	break;
+	case WM_TIMER:
+		if (wParam == SHUTDOWN_TIMER_ID)
+		{
+			KillTimer(hWnd, SHUTDOWN_TIMER_ID);
+			DestroyWindow(hWnd);
+		}
+		break;
+	case WM_DESTROY:
+		g_shuttingDown = true;
 		{
 			std::lock_guard lock(g_connectionMutex);
 			for (const auto& connection : g_audioPlaybackConnections)
 				connection.second.Connection.Close();
 			g_audioPlaybackConnections.clear();
 			g_deviceErrorMessages.clear();
-		}
-		if (!g_reconnect)
-		{
-			SaveSettings();
 		}
 		Shell_NotifyIconW(NIM_DELETE, &g_nid);
 		PostQuitMessage(0);
@@ -553,31 +592,19 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	}
 
 	bool success = false;
-	bool waitForAudioSinkRelease = false;
-	uint64_t successfulGeneration = 0;
 	std::wstring errorMessage;
+	AudioPlaybackConnection connection = nullptr;
+	uint64_t generation = 0;
 
-	for (int attempt = 0; attempt < MAX_CONNECTION_ATTEMPTS && !g_shuttingDown; ++attempt)
+	try
 	{
-		if (attempt != 0)
+		connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
+		if (!connection)
 		{
-			const auto retryDelay = waitForAudioSinkRelease ? AUDIO_SINK_RELEASE_DELAY : CONNECTION_RETRY_DELAY;
-			waitForAudioSinkRelease = false;
-			co_await winrt::resume_after(retryDelay);
-			co_await uiContext;
+			errorMessage = _(L"Unknown error");
 		}
-
-		AudioPlaybackConnection connection = nullptr;
-		uint64_t generation = 0;
-		try
+		else
 		{
-			connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
-			if (!connection)
-			{
-				errorMessage = _(L"Unknown error");
-				continue;
-			}
-
 			generation = ++g_nextConnectionGeneration;
 			{
 				std::lock_guard lock(g_connectionMutex);
@@ -592,49 +619,20 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 					QueueConnectionStateChanged(deviceId, generation);
 			});
 
-			// Keep the original enable/open order, but do not let a Windows Bluetooth
-			// operation leave the custom picker permanently stuck in "Connecting".
-			auto startOperation = connection.StartAsync();
-			const auto startDeadline = std::chrono::steady_clock::now() + CONNECTION_START_TIMEOUT;
-			while (startOperation.Status() == AsyncStatus::Started &&
-				std::chrono::steady_clock::now() < startDeadline && !g_shuttingDown)
-				co_await winrt::resume_after(CONNECTION_OPERATION_POLL_INTERVAL);
+			// StartAsync is tied to this connection instance. Every newly created
+			// connection must be enabled before it is opened.
+			co_await connection.StartAsync();
 			co_await uiContext;
 			if (g_shuttingDown)
-			{
-				startOperation.Cancel();
 				co_return;
-			}
-			if (startOperation.Status() == AsyncStatus::Started)
-			{
-				startOperation.Cancel();
-				winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
-			}
-			startOperation.GetResults();
-
-			auto openOperation = connection.OpenAsync();
-			const auto openDeadline = std::chrono::steady_clock::now() + CONNECTION_OPEN_TIMEOUT;
-			while (openOperation.Status() == AsyncStatus::Started &&
-				std::chrono::steady_clock::now() < openDeadline && !g_shuttingDown)
-				co_await winrt::resume_after(CONNECTION_OPERATION_POLL_INTERVAL);
+			auto result = co_await connection.OpenAsync();
 			co_await uiContext;
 			if (g_shuttingDown)
-			{
-				openOperation.Cancel();
 				co_return;
-			}
-			if (openOperation.Status() == AsyncStatus::Started)
-			{
-				openOperation.Cancel();
-				winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
-			}
-			auto result = openOperation.GetResults();
 
 			switch (result.Status())
 			{
 			case AudioPlaybackConnectionOpenResultStatus::Success:
-				// This is intentionally based on OpenAsync's result, like the
-				// original implementation. StateChanged keeps the UI in sync later.
 				success = IsCurrentConnection(deviceId, generation);
 				break;
 			case AudioPlaybackConnectionOpenResultStatus::RequestTimedOut:
@@ -657,59 +655,33 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				}
 				break;
 			}
-
-			// Some Windows 11 Bluetooth stacks report the first OpenAsync as
-			// successful before the A2DP route is usable. Recreate the connection
-			// once internally, matching the manual disconnect/reconnect workaround.
-			bool activationPending = true;
-			if (success && g_initialAudioSinkActivationPending.compare_exchange_strong(activationPending, false))
-			{
-				CloseCurrentConnection(deviceId, generation);
-				success = false;
-				waitForAudioSinkRelease = true;
-				errorMessage.clear();
-				continue;
-			}
-		}
-		catch (winrt::hresult_error const& ex)
-		{
-			success = false;
-			errorMessage.resize(64);
-			while (1)
-			{
-				auto result = swprintf(errorMessage.data(), errorMessage.size(), L"%s (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
-				if (result < 0)
-					errorMessage.resize(errorMessage.size() * 2);
-				else
-				{
-					errorMessage.resize(result);
-					break;
-				}
-			}
-			LOG_CAUGHT_EXCEPTION();
-		}
-		catch (...)
-		{
-			success = false;
-			errorMessage = _(L"Unknown error");
-			LOG_CAUGHT_EXCEPTION();
-		}
-
-		if (success)
-		{
-			successfulGeneration = generation;
-			break;
-		}
-
-		if (generation != 0)
-		{
-			if (!IsCurrentConnection(deviceId, generation))
-				co_return;
-			CloseCurrentConnection(deviceId, generation);
 		}
 	}
+	catch (winrt::hresult_error const& ex)
+	{
+		success = false;
+		errorMessage.resize(64);
+		while (1)
+		{
+			auto result = swprintf(errorMessage.data(), errorMessage.size(), L"%s (0x%08X)", ex.message().c_str(), static_cast<uint32_t>(ex.code()));
+			if (result < 0)
+				errorMessage.resize(errorMessage.size() * 2);
+			else
+			{
+				errorMessage.resize(result);
+				break;
+			}
+		}
+		LOG_CAUGHT_EXCEPTION();
+	}
+	catch (...)
+	{
+		success = false;
+		errorMessage = _(L"Unknown error");
+		LOG_CAUGHT_EXCEPTION();
+	}
 
-	if (success && IsCurrentConnection(deviceId, successfulGeneration))
+	if (success && IsCurrentConnection(deviceId, generation))
 	{
 		{
 			std::lock_guard lock(g_connectionMutex);
@@ -722,8 +694,13 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	}
 	else if (!g_shuttingDown)
 	{
-		std::lock_guard lock(g_connectionMutex);
-		g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
+		if (generation != 0 && IsCurrentConnection(deviceId, generation))
+			CloseCurrentConnection(deviceId, generation);
+
+		{
+			std::lock_guard lock(g_connectionMutex);
+			g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
+		}
 	}
 
 	QueueDeviceListRefresh();
