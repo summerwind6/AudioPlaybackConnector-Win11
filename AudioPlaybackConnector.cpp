@@ -578,7 +578,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 					connection, generation, true
 				});
 			}
-			RefreshDevicePicker();
+			QueueDeviceListRefresh();
 
 			connection.StateChanged([deviceId, generation](const auto& sender, const auto&) {
 				if (sender.State() == AudioPlaybackConnectionState::Closed)
@@ -669,7 +669,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		g_deviceErrorMessages[deviceId] = errorMessage.empty() ? _(L"Unknown error") : errorMessage;
 	}
 
-	RefreshDevicePicker();
+	QueueDeviceListRefresh();
 }
 
 void DisconnectDevice(std::wstring_view deviceId)
