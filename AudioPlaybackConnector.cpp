@@ -69,6 +69,7 @@ void ApplyWin11MenuStyle(MenuFlyout& menu, bool lightTheme)
 
 constexpr int MAX_CONNECTION_ATTEMPTS = 3;
 constexpr auto CONNECTION_RETRY_DELAY = std::chrono::milliseconds(400);
+constexpr auto AUDIO_SINK_RELEASE_DELAY = std::chrono::seconds(2);
 constexpr auto CONNECTION_OPERATION_POLL_INTERVAL = std::chrono::milliseconds(100);
 constexpr auto CONNECTION_START_TIMEOUT = std::chrono::seconds(10);
 constexpr auto CONNECTION_OPEN_TIMEOUT = std::chrono::seconds(20);
@@ -552,6 +553,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	}
 
 	bool success = false;
+	bool waitForAudioSinkRelease = false;
 	uint64_t successfulGeneration = 0;
 	std::wstring errorMessage;
 
@@ -559,7 +561,9 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	{
 		if (attempt != 0)
 		{
-			co_await winrt::resume_after(CONNECTION_RETRY_DELAY);
+			const auto retryDelay = waitForAudioSinkRelease ? AUDIO_SINK_RELEASE_DELAY : CONNECTION_RETRY_DELAY;
+			waitForAudioSinkRelease = false;
+			co_await winrt::resume_after(retryDelay);
 			co_await uiContext;
 		}
 
@@ -662,6 +666,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			{
 				CloseCurrentConnection(deviceId, generation);
 				success = false;
+				waitForAudioSinkRelease = true;
 				errorMessage.clear();
 				continue;
 			}
