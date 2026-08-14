@@ -72,6 +72,7 @@ constexpr auto CONNECTION_RETRY_DELAY = std::chrono::milliseconds(400);
 constexpr auto CONNECTION_OPERATION_POLL_INTERVAL = std::chrono::milliseconds(100);
 constexpr auto CONNECTION_START_TIMEOUT = std::chrono::seconds(10);
 constexpr auto CONNECTION_OPEN_TIMEOUT = std::chrono::seconds(20);
+constexpr auto INITIAL_AUDIO_SINK_WARMUP_DELAY = std::chrono::milliseconds(1200);
 
 bool IsCurrentConnection(std::wstring_view deviceId, uint64_t generation)
 {
@@ -607,6 +608,18 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
 			}
 			startOperation.GetResults();
+
+			// On Windows 11, the first StartAsync can complete before the A2DP sink
+			// endpoint is ready to route audio. Give only the initial connection a
+			// short warm-up period, then return to the UI apartment before OpenAsync.
+			bool warmupPending = true;
+			if (g_initialAudioSinkWarmupPending.compare_exchange_strong(warmupPending, false))
+			{
+				co_await winrt::resume_after(INITIAL_AUDIO_SINK_WARMUP_DELAY);
+				co_await uiContext;
+				if (g_shuttingDown || !IsCurrentConnection(deviceId, generation))
+					co_return;
+			}
 
 			auto openOperation = connection.OpenAsync();
 			const auto openDeadline = std::chrono::steady_clock::now() + CONNECTION_OPEN_TIMEOUT;
