@@ -9,12 +9,8 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation);
 void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
-void StartDeviceWatcher();
-void StopDeviceWatcher();
 void SetupSvgIcon();
 void UpdateNotifyIcon();
-
-constexpr WPARAM DEVICE_LIST_ENUMERATION_COMPLETED = 1;
 
 void QueueDeviceListRefresh()
 {
@@ -199,7 +195,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	{
 	case WM_DESTROY:
 		g_shuttingDown = true;
-		StopDeviceWatcher();
+		if (g_deviceWatcher)
+			g_deviceWatcher.Stop();
 		if (g_reconnect)
 			SaveSettings();
 		{
@@ -222,7 +219,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			UpdateNotifyIcon();
 			SetupFlyout();
 			SetupMenu();
-			StopDeviceWatcher();
 			SetupDevicePicker();
 		}
 		break;
@@ -255,7 +251,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SetForegroundWindow(hWnd);
 			g_xamlCanvas.Width(rect.Width);
 			g_xamlCanvas.Height(rect.Height);
-			StartDeviceWatcher();
+			g_devicePickerVisible = true;
 			RefreshDevicePicker();
 			g_xamlDeviceFlyout.ShowAt(g_xamlCanvas);
 		}
@@ -303,8 +299,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	break;
 	case WM_DEVICE_LIST_CHANGED:
 		RefreshDevicePicker();
-		if (wParam == DEVICE_LIST_ENUMERATION_COMPLETED)
-			StopDeviceWatcher();
 		break;
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
@@ -825,32 +819,17 @@ void RefreshDevicePicker()
 	}
 }
 
-void StopDeviceWatcher()
+void SetupDevicePicker()
 {
-	++g_deviceWatcherGeneration;
-	if (!g_deviceWatcher)
-		return;
+	using namespace winrt::Windows::UI::Xaml::Media;
 
-	try
-	{
-		const auto status = g_deviceWatcher.Status();
-		if (status == DeviceWatcherStatus::Started ||
-			status == DeviceWatcherStatus::EnumerationCompleted)
-			g_deviceWatcher.Stop();
-	}
-	catch (...)
-	{
-		LOG_CAUGHT_EXCEPTION();
-	}
-	g_deviceWatcher = nullptr;
-}
-
-void StartDeviceWatcher()
-{
-	StopDeviceWatcher();
+	const bool lightTheme = IsLightTheme();
 	const auto watcherGeneration = ++g_deviceWatcherGeneration;
 	try
 	{
+		if (g_deviceWatcher)
+			g_deviceWatcher.Stop();
+
 		{
 			std::lock_guard lock(g_deviceListMutex);
 			g_availableDeviceNames.clear();
@@ -864,7 +843,7 @@ void StartDeviceWatcher()
 				std::lock_guard lock(g_deviceListMutex);
 				g_availableDeviceNames.insert_or_assign(std::wstring(device.Id()), std::wstring(device.Name()));
 			}
-			if (IsWindow(g_hWnd))
+			if (g_devicePickerVisible && IsWindow(g_hWnd))
 				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
 		});
 		g_deviceWatcher.Removed([watcherGeneration](const auto&, const auto& update) {
@@ -874,21 +853,21 @@ void StartDeviceWatcher()
 				std::lock_guard lock(g_deviceListMutex);
 				g_availableDeviceNames.erase(std::wstring(update.Id()));
 			}
-			if (IsWindow(g_hWnd))
+			if (g_devicePickerVisible && IsWindow(g_hWnd))
 				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
 		});
 		g_deviceWatcher.Updated([watcherGeneration](const auto&, const auto&) {
 			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
 				return;
-			if (IsWindow(g_hWnd))
+			if (g_devicePickerVisible && IsWindow(g_hWnd))
 				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
 		});
 		g_deviceWatcher.EnumerationCompleted([watcherGeneration](const auto&, const auto&) {
 			if (g_shuttingDown || watcherGeneration != g_deviceWatcherGeneration)
 				return;
 			g_deviceEnumerationCompleted = true;
-			if (IsWindow(g_hWnd))
-				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, DEVICE_LIST_ENUMERATION_COMPLETED, 0);
+			if (g_devicePickerVisible && IsWindow(g_hWnd))
+				PostMessageW(g_hWnd, WM_DEVICE_LIST_CHANGED, 0, 0);
 		});
 		g_deviceWatcher.Start();
 	}
@@ -897,13 +876,6 @@ void StartDeviceWatcher()
 		g_deviceEnumerationCompleted = true;
 		LOG_CAUGHT_EXCEPTION();
 	}
-}
-
-void SetupDevicePicker()
-{
-	using namespace winrt::Windows::UI::Xaml::Media;
-
-	const bool lightTheme = IsLightTheme();
 
 	const auto textBrush = CreateTextBrush(lightTheme);
 	const auto secondaryTextBrush = CreateTextBrush(lightTheme, 185);
@@ -992,7 +964,7 @@ void SetupDevicePicker()
 	flyout.Placement(winrt::Windows::UI::Xaml::Controls::Primitives::FlyoutPlacementMode::Top);
 	flyout.Content(card);
 	flyout.Closed([](const auto&, const auto&) {
-		StopDeviceWatcher();
+		g_devicePickerVisible = false;
 		ShowWindow(g_hWnd, SW_HIDE);
 	});
 

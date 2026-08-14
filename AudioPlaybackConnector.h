@@ -61,6 +61,7 @@ std::vector<std::wstring> g_lastDevices;
 uint64_t g_nextConnectionGeneration = 0;
 std::atomic_uint64_t g_deviceWatcherGeneration = 0;
 std::atomic_bool g_deviceEnumerationCompleted = false;
+std::atomic_bool g_devicePickerVisible = false;
 std::atomic_bool g_shuttingDown = false;
 
 #include "Util.hpp"
