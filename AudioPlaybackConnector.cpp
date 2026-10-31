@@ -4,8 +4,9 @@
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 void SetupFlyout();
 void SetupMenu();
-winrt::fire_and_forget ConnectDevice(std::wstring);
-winrt::fire_and_forget ConnectDevice(DeviceInformation);
+winrt::fire_and_forget ConnectDevice(std::wstring, bool automaticRecovery = true);
+winrt::fire_and_forget ConnectDevice(DeviceInformation, bool automaticRecovery = true);
+winrt::fire_and_forget RecoverDevice(std::wstring);
 void RefreshDevicePicker();
 void DisconnectDevice(std::wstring_view);
 void SetupDevicePicker();
@@ -333,6 +334,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			auto it = g_audioPlaybackConnections.find(stateChanged->deviceId);
 			if (it == g_audioPlaybackConnections.end() ||
 				it->second.Generation != stateChanged->generation ||
+				it->second.Connecting ||
 				it->second.Connection.State() != AudioPlaybackConnectionState::Closed)
 				break;
 			g_audioPlaybackConnections.erase(it);
@@ -511,7 +513,7 @@ void SetupMenu()
 	g_xamlMenu = menu;
 }
 
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId, bool automaticRecovery)
 {
 	// DeviceWatcher callbacks can run outside the XAML apartment. Recreate the
 	// device on the UI apartment before starting the audio connection, matching
@@ -525,7 +527,7 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 			co_return;
 		if (device)
 		{
-			ConnectDevice(device);
+			ConnectDevice(device, automaticRecovery);
 			co_return;
 		}
 	}
@@ -561,7 +563,7 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 	QueueDeviceListRefresh();
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device, bool automaticRecovery)
 {
 	// The original project performed the complete StartAsync/OpenAsync sequence
 	// from the picker UI apartment. Preserve that behavior while the custom UI
@@ -623,11 +625,11 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			// connection must be enabled before it is opened.
 			co_await connection.StartAsync();
 			co_await uiContext;
-			if (g_shuttingDown)
+			if (g_shuttingDown || !IsCurrentConnection(deviceId, generation))
 				co_return;
 			auto result = co_await connection.OpenAsync();
 			co_await uiContext;
-			if (g_shuttingDown)
+			if (g_shuttingDown || !IsCurrentConnection(deviceId, generation))
 				co_return;
 
 			switch (result.Status())
@@ -680,9 +682,16 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		errorMessage = _(L"Unknown error");
 		LOG_CAUGHT_EXCEPTION();
 	}
-
 	if (success && IsCurrentConnection(deviceId, generation))
 	{
+		if (automaticRecovery)
+		{
+			// Release this coroutine's reference before RecoverDevice removes the
+			// connection from the table. A second open must never repeat recovery.
+			connection = nullptr;
+			RecoverDevice(deviceId);
+			co_return;
+		}
 		{
 			std::lock_guard lock(g_connectionMutex);
 			auto it = g_audioPlaybackConnections.find(deviceId);
@@ -721,17 +730,41 @@ void DisconnectDevice(std::wstring_view deviceId)
 	QueueDeviceListRefresh();
 }
 
+winrt::fire_and_forget RecoverDevice(std::wstring deviceId)
+{
+	auto uiContext = winrt::apartment_context();
+	{
+		std::lock_guard lock(g_connectionMutex);
+		if (!g_recoveringDevices.insert(deviceId).second)
+			co_return;
+	}
+	// DisconnectDevice closes and removes the last application-owned connection
+	// before the new one is created. The remote player may pause on disconnect.
+	DisconnectDevice(deviceId);
+	co_await winrt::resume_after(std::chrono::seconds(2));
+	co_await uiContext;
+	{
+		std::lock_guard lock(g_connectionMutex);
+		g_recoveringDevices.erase(deviceId);
+	}
+	if (!g_shuttingDown)
+		ConnectDevice(std::move(deviceId), false);
+}
+
 void AddDevicePickerRow(std::wstring const& deviceId, std::wstring const& deviceName, bool lightTheme)
 {
 	using namespace winrt::Windows::UI::Xaml::Media;
 
 	bool connecting = false;
 	bool connected = false;
+	bool recovering = false;
 	std::wstring errorMessage;
 	{
 		std::lock_guard lock(g_connectionMutex);
 		auto connection = g_audioPlaybackConnections.find(deviceId);
-		connecting = connection != g_audioPlaybackConnections.end() && connection->second.Connecting;
+		recovering = g_recoveringDevices.count(deviceId) != 0;
+		connecting = recovering ||
+			(connection != g_audioPlaybackConnections.end() && connection->second.Connecting);
 		// UI status is derived from the completed connection operation. Avoid
 		// querying the WinRT audio object merely to repaint the custom picker.
 		connected = connection != g_audioPlaybackConnections.end() && !connecting;

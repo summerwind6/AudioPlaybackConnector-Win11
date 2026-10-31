@@ -42,6 +42,7 @@ MenuFlyout g_xamlMenu = nullptr;
 FocusState g_menuFocusState = FocusState::Unfocused;
 DeviceWatcher g_deviceWatcher = nullptr;
 std::unordered_map<std::wstring, AudioPlaybackConnectionEntry> g_audioPlaybackConnections;
+std::unordered_set<std::wstring> g_recoveringDevices;
 std::unordered_map<std::wstring, std::wstring> g_deviceErrorMessages;
 std::unordered_map<std::wstring, std::wstring> g_availableDeviceNames;
 std::recursive_mutex g_connectionMutex;
